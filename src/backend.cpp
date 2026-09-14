@@ -148,6 +148,15 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
 static unsigned profile_format(VAProfile p) {
     return is_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
 }
+static unsigned advertised_profile_formats(VAProfile p) {
+    unsigned formats = profile_format(p);
+    // Chromium probes HEVC Main10 with YUV420 even though it later allocates
+    // and exports P010 surfaces.  Advertise the compatibility format so the
+    // profile is not discarded during VA-API capability discovery.
+    if (p == VAProfileHEVCMain10)
+        formats |= VA_RT_FORMAT_YUV420;
+    return formats;
+}
 static unsigned profile_fourcc(VAProfile p) {
     return is_10bit(p) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 }
@@ -298,7 +307,7 @@ API(
         }
         switch (attrs[i].type) {
         case VAConfigAttribRTFormat:
-            attrs[i].value = profile_format(profile);
+            attrs[i].value = advertised_profile_formats(profile);
             break;
         case VAConfigAttribDecSliceMode:
             attrs[i].value = VA_DEC_SLICE_MODE_NORMAL;
@@ -338,7 +347,8 @@ API(
                 config.rate_control = attrs[i].value;
             }
         } else if (attrs[i].type == VAConfigAttribRTFormat)
-            check(attrs[i].value == profile_format(p), "unsupported render format",
+            check(attrs[i].value && !(attrs[i].value & ~advertised_profile_formats(p)),
+                  "unsupported render format",
                   VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
         else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
             check(attrs[i].value == VA_DEC_SLICE_MODE_NORMAL, "unsupported slice mode",
