@@ -87,7 +87,7 @@ template <class F> VAStatus guard(VADriverContextP ctx, F f) noexcept {
     }
 static bool supported(VAProfile p) {
     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
-           p == VAProfileH264High || is_hevc(p) || is_vp9(p);
+           p == VAProfileH264High || is_hevc(p) || is_vp9(p) || is_av1(p);
 }
 static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
     return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
@@ -146,6 +146,8 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
     }
 }
 static unsigned profile_format(VAProfile p) {
+    if (is_av1(p))
+        return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
     return is_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
 }
 static unsigned advertised_profile_formats(VAProfile p) {
@@ -272,7 +274,8 @@ API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
     check(out && count, "null profiles", VA_STATUS_ERROR_INVALID_PARAMETER);
     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
     out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain; out[4] = VAProfileHEVCMain10;
-    out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2; *count = 7;
+    out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2;
+    out[7] = VAProfileAV1Profile0; *count = 8;
     if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
     return VA_STATUS_SUCCESS;)
 API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
@@ -372,34 +375,37 @@ API(
     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
     auto profile = config.profile;
     check(count, "null surface attribute count", VA_STATUS_ERROR_INVALID_PARAMETER);
-    VASurfaceAttrib a[6]{};
-    VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribMinWidth,
-                                   VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
-                                   VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
-    unsigned values[] = {profile_fourcc(profile), 128, 128, 8192, 8192,
-                         VA_SURFACE_ATTRIB_MEM_TYPE_VA};
+    VASurfaceAttrib a[7]{};
+    VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribPixelFormat,
+                                   VASurfaceAttribMinWidth, VASurfaceAttribMinHeight,
+                                   VASurfaceAttribMaxWidth, VASurfaceAttribMaxHeight,
+                                   VASurfaceAttribMemoryType};
+    unsigned values[] = {VA_FOURCC_NV12,
+                         is_av1(profile) ? VA_FOURCC_P010 : profile_fourcc(profile),
+                         128, 128, 8192, 8192, VA_SURFACE_ATTRIB_MEM_TYPE_VA};
+    unsigned first = is_av1(profile) ? 0 : 1;
     if (config.entrypoint == VAEntrypointVideoProc) {
-        values[1] = 16;
-        values[2] = 2;
-        values[5] |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+        values[2] = 16;
+        values[3] = 2;
+        values[6] |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
     } if (config.entrypoint == VAEntrypointEncSlice) {
-        values[3] = 3840;
-        values[4] = 2160;
-    } for (unsigned i = 0; i < 6; ++i) {
+        values[4] = 3840;
+        values[5] = 2160;
+    } for (unsigned i = first; i < 7; ++i) {
         a[i].type = types[i];
         a[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
-        if (i == 0 || i == 5)
+        if (i <= 1 || i == 6)
             a[i].flags |= VA_SURFACE_ATTRIB_SETTABLE;
         a[i].value.type = VAGenericValueTypeInteger;
         a[i].value.value.i = values[i];
     } if (!attrs) {
-        *count = 6;
+        *count = 7 - first;
         return VA_STATUS_SUCCESS;
-    } if (*count < 6) {
-        *count = 6;
+    } if (*count < 7 - first) {
+        *count = 7 - first;
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-    } std::memcpy(attrs, a, sizeof(a));
-    *count = 6; return VA_STATUS_SUCCESS;)
+    } std::memcpy(attrs, a + first, sizeof(*a) * (7 - first));
+    *count = 7 - first; return VA_STATUS_SUCCESS;)
 static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &desc, unsigned width,
                                             unsigned height) {
     check(desc.fourcc == VA_FOURCC_NV12 && desc.width == width && desc.height == height &&
@@ -542,9 +548,12 @@ API(create_context,
               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
     int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
-    if (c->entrypoint == VAEntrypointVLD)
-        c->decoder = std::make_shared<Decoder>(d.device, w, h, std::max(0, count), c->profile,
-                                               render_fd);
+    c->decoder_surfaces = std::max(0, count);
+    if (c->entrypoint == VAEntrypointVLD && !is_av1(c->profile)) {
+        c->decoder_fourcc = profile_fourcc(c->profile);
+        c->decoder = std::make_shared<Decoder>(d.device, w, h, c->decoder_surfaces, c->profile,
+                                               c->decoder_fourcc, render_fd);
+    }
     if (processing) c->vpp = std::make_unique<Vpp>(); *result = d.next_id++;
     d.contexts[*result] = c; return VA_STATUS_SUCCESS;)
 API(
@@ -611,7 +620,9 @@ API(
     auto c = context(d, id);
     check(!c->target, "picture already open", VA_STATUS_ERROR_OPERATION_FAILED);
     auto s = surface(d, target);
-    check(s->fourcc == profile_fourcc(c->profile), "surface format does not match context",
+    check(is_av1(c->profile) ? (s->fourcc == VA_FOURCC_NV12 || s->fourcc == VA_FOURCC_P010)
+                             : s->fourcc == profile_fourcc(c->profile),
+          "surface format does not match context",
           VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     if (s->pending || (s->encode_task && s->encode_task->pending)) synchronize(d, s);
     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
@@ -628,9 +639,23 @@ API(
         c->target = s;
         c->vpp_picture = {};
         return VA_STATUS_SUCCESS;
+    } if (is_av1(c->profile)) {
+        c->av1_hidden.erase(target);
+        check(!c->decoder || c->decoder_fourcc == s->fourcc,
+              "AV1 surface format changed within a context",
+              VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+        if (!c->decoder) {
+            int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
+            c->decoder_fourcc = s->fourcc;
+            c->decoder = std::make_shared<Decoder>(d.device, c->width, c->height,
+                                                   c->decoder_surfaces, c->profile, s->fourcc,
+                                                   render_fd);
+        }
     } if (!s->persistent_export) s->memory.reset();
-    s->status = VA_STATUS_SUCCESS; s->decoder = c->decoder; c->target = s; c->picture = Picture{};
-    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{}; return VA_STATUS_SUCCESS;)
+    s->status = VA_STATUS_SUCCESS; s->decoder = c->decoder; c->target = s; c->target_id = target;
+    c->picture = Picture{};
+    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{};
+    c->av1_picture = Av1Picture{}; return VA_STATUS_SUCCESS;)
 template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer> &b) {
     using Parameter = typename std::decay_t<decltype(p.pending_slices)>::value_type;
     using SliceType = typename std::decay_t<decltype(p.slices)>::value_type;
@@ -680,6 +705,26 @@ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer>
         p.pending_slices.clear();
     }
 }
+static void render_av1_buffer(Av1Picture &p, const std::shared_ptr<Buffer> &b) {
+    if (b->type == VAPictureParameterBufferType) {
+        check(b->element_size >= sizeof(p.params) && b->elements == 1,
+              "invalid AV1 picture parameters", VA_STATUS_ERROR_INVALID_BUFFER);
+        std::memcpy(&p.params, b->data.data(), sizeof(p.params));
+        p.has_params = true;
+    } else if (b->type == VASliceParameterBufferType) {
+        check(b->element_size >= sizeof(VASliceParameterBufferAV1),
+              "invalid AV1 slice parameters", VA_STATUS_ERROR_INVALID_BUFFER);
+        for (unsigned i = 0; i < b->elements; ++i) {
+            VASliceParameterBufferAV1 slice{};
+            std::memcpy(&slice, b->data.data() + size_t(i) * b->element_size, sizeof(slice));
+            p.slices.push_back(slice);
+        }
+    } else if (b->type == VASliceDataBufferType) {
+        p.data.push_back(b->data);
+    } else {
+        throw Error(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE, "unsupported AV1 buffer type");
+    }
+}
 API(
     render_picture, (VADriverContextP ctx, VAContextID id, VABufferID *ids, int count),
     auto c = context(d, id);
@@ -699,7 +744,9 @@ API(
             check(b->context_id == id, "encode buffer belongs to another context",
                   VA_STATUS_ERROR_INVALID_BUFFER);
             render_encode_buffer(c->encode_settings, c->encode_picture, *b);
-        } else if (is_vp9(c->profile))
+        } else if (is_av1(c->profile))
+            render_av1_buffer(c->av1_picture, b);
+        else if (is_vp9(c->profile))
             render_buffer(c->vp9_picture, b);
         else if (is_hevc(c->profile))
             render_buffer(c->hevc_picture, b);
@@ -751,7 +798,27 @@ API(
     } try {
         // Do not cache parameter sets from a rejected picture: the firmware
         // has not received them. Commit only after successful submission.
-        if (is_vp9(c->profile)) {
+        if (is_av1(c->profile)) {
+            auto next_state = c->av1;
+            auto bytes = av1_bitstream(c->profile, c->av1_picture, target->fourcc, next_state);
+            const auto &params = c->av1_picture.params;
+            for (unsigned slot = 0; slot < 8; ++slot) {
+                auto hidden = c->av1_hidden.find(params.ref_frame_map[slot]);
+                if (hidden == c->av1_hidden.end())
+                    continue;
+                c->decoder->submit(av1_show_existing(slot), hidden->second);
+                synchronize(d, hidden->second);
+                c->av1_hidden.erase(hidden);
+            }
+            if (params.pic_info_fields.bits.show_frame) {
+                c->decoder->submit(bytes, target);
+            } else {
+                c->decoder->submit_invisible(bytes);
+                target->pending = false;
+                c->av1_hidden[c->target_id] = target;
+            }
+            c->av1 = std::move(next_state);
+        } else if (is_vp9(c->profile)) {
             auto bytes = vp9_bitstream(c->profile, c->vp9_picture);
             c->decoder->submit(bytes, target);
         } else if (is_hevc(c->profile)) {

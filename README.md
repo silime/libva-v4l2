@@ -12,10 +12,17 @@ it is not a generic backend for all V4L2 devices.
 | H.264 / AVC | Constrained Baseline, Main, High (8-bit) | Same profiles (8-bit) |
 | H.265 / HEVC | Main, Main10 (8/10-bit) | Main (8-bit) |
 | VP9 | Profiles 0 and 2 (8/10-bit) | — |
+| AV1 | Main / Profile 0 (8/10-bit) | — |
 
 Supported video is progressive 4:2:0. Decoding has been tested with FFmpeg,
 GStreamer, mpv, VLC, Chromium, and Kodi; H.264 encoding with FFmpeg, GStreamer,
 and Sunshine. HEVC encoding is tested with FFmpeg and GStreamer.
+
+AV1 decoding currently accepts complete low-overhead coded OBU frames as
+submitted by Chromium. FFmpeg's AV1 VA-API frontend submits tile payloads
+without the sequence and frame OBU headers required by a stateful decoder, so
+FFmpeg AV1 VA-API decoding is not yet supported. AV1 film-grain display
+surfaces and large-scale tiles are also unsupported.
 
 - H.264 and HEVC encoding support CQP, CBR, and VBR, even dimensions from 128×128 to
   3840×2160, and I/P frames with one reference. I-frame requests produce IDR frames; B frames

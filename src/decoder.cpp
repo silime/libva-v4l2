@@ -92,9 +92,9 @@ std::string find_device() {
     throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Iris stateful H264 decoder found");
 }
 Decoder::Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
-                 VAProfile profile, int render_fd)
+                 VAProfile profile, unsigned fourcc, int render_fd)
     : width_(width), height_(height), pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
-      fourcc_(is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12), copier_(render_fd) {
+      fourcc_(fourcc), copier_(render_fd) {
     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     check(fd_ >= 0, "open Iris decoder");
     try {
@@ -105,7 +105,8 @@ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, uns
         fmt.type = OUTPUT;
         fmt.fmt.pix_mp.width = width;
         fmt.fmt.pix_mp.height = height;
-        fmt.fmt.pix_mp.pixelformat = is_vp9(profile)    ? V4L2_PIX_FMT_VP9
+        fmt.fmt.pix_mp.pixelformat = is_av1(profile)    ? V4L2_PIX_FMT_AV1
+                                     : is_vp9(profile)  ? V4L2_PIX_FMT_VP9
                                      : is_hevc(profile) ? V4L2_PIX_FMT_HEVC
                                                         : V4L2_PIX_FMT_H264;
         unsigned codec = fmt.fmt.pix_mp.pixelformat;
@@ -361,6 +362,40 @@ void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Su
             check(!expired(start), "initial SOURCE_CHANGE timeout", VA_STATUS_ERROR_TIMEDOUT);
             pump(20);
         }
+    }
+}
+void Decoder::submit_invisible(const std::vector<uint8_t> &bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pump(0);
+    auto start = std::chrono::steady_clock::now();
+    std::shared_ptr<Memory> slot;
+    while (!slot) {
+        for (auto &m : output_)
+            if (!m->queued) {
+                slot = m;
+                break;
+            }
+        if (!slot) {
+            check(!expired(start), "OUTPUT queue timeout", VA_STATUS_ERROR_TIMEDOUT);
+            pump(20);
+        }
+    }
+    check(!bytes.empty() && bytes.size() <= slot->size, "compressed picture too large",
+          VA_STATUS_ERROR_INVALID_BUFFER);
+    std::memcpy(slot->mapping, bytes.data(), bytes.size());
+    if (dump_) {
+        fwrite(bytes.data(), 1, bytes.size(), dump_);
+        fflush(dump_);
+    }
+    QueueBuffer q(OUTPUT, slot->index);
+    q.plane.bytesused = bytes.size();
+    q.plane.length = slot->size;
+    checked(fd_, VIDIOC_QBUF, &q.buffer, "QBUF invisible OUTPUT");
+    slot->queued = true;
+    trace("submit invisible bytes=%zu", bytes.size());
+    while (slot->queued) {
+        check(!expired(start), "invisible OUTPUT timeout", VA_STATUS_ERROR_TIMEDOUT);
+        pump(20);
     }
 }
 void Decoder::refresh() {

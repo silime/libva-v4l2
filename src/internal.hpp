@@ -4,6 +4,7 @@
 #include <va/va_backend.h>
 #include <va/va_backend_vpp.h>
 #include <va/va_drmcommon.h>
+#include <va/va_dec_av1.h>
 #include <va/va_dec_hevc.h>
 #include <va/va_dec_vp9.h>
 #include <va/va_enc_h264.h>
@@ -144,6 +145,9 @@ inline bool is_hevc(VAProfile p) {
 inline bool is_vp9(VAProfile p) {
     return p == VAProfileVP9Profile0 || p == VAProfileVP9Profile2;
 }
+inline bool is_av1(VAProfile p) {
+    return p == VAProfileAV1Profile0;
+}
 inline bool is_10bit(VAProfile p) {
     return p == VAProfileHEVCMain10 || p == VAProfileVP9Profile2;
 }
@@ -157,6 +161,19 @@ struct Vp9Picture {
     std::vector<VASliceParameterBufferVP9> pending_slices;
     std::vector<Vp9Slice> slices;
 };
+struct Av1Picture {
+    VADecPictureParameterBufferAV1 params{};
+    bool has_params = false;
+    std::vector<VASliceParameterBufferAV1> slices;
+    std::vector<std::vector<uint8_t>> data;
+};
+struct Av1State {
+    std::vector<uint8_t> sequence;
+    bool started = false;
+};
+std::vector<uint8_t> av1_bitstream(VAProfile profile, const Av1Picture &picture,
+                                   unsigned fourcc, Av1State &state);
+std::vector<uint8_t> av1_show_existing(unsigned slot);
 std::vector<uint8_t> vp9_bitstream(VAProfile profile, const Vp9Picture &picture);
 std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H264State &state);
 std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
@@ -180,9 +197,10 @@ class Decoder {
 
   public:
     Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
-            VAProfile profile, int render_fd);
+            VAProfile profile, unsigned fourcc, int render_fd);
     ~Decoder();
     void submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Surface> &surface);
+    void submit_invisible(const std::vector<uint8_t> &bytes);
     void sync(const std::shared_ptr<Surface> &surface);
     void finish();
     void refresh();
@@ -260,6 +278,12 @@ struct Context {
     HevcPicture hevc_picture;
     HevcState hevc;
     Vp9Picture vp9_picture;
+    Av1Picture av1_picture;
+    Av1State av1;
+    std::map<VASurfaceID, std::shared_ptr<Surface>> av1_hidden;
+    VASurfaceID target_id = VA_INVALID_ID;
+    unsigned decoder_surfaces = 0;
+    unsigned decoder_fourcc = 0;
 };
 struct Config {
     VAProfile profile;

@@ -48,6 +48,7 @@ endif
 summary('FastCV CDSP VPP', have_fastcv)
 
 sources = files(
+  'src/av1.cpp',
   'src/backend.cpp',
   'src/decoder.cpp',
   'src/encoder.cpp',
