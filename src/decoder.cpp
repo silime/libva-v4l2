@@ -9,6 +9,12 @@
 #include <glob.h>
 #include <cerrno>
 
+#ifndef V4L2_PIX_FMT_AV1
+// Added to the kernel UAPI after Ubuntu Noble's headers. The fourcc is ABI,
+// so defining it locally remains compatible with newer Iris kernels.
+#define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '0', '1')
+#endif
+
 namespace irisva {
 namespace {
 constexpr unsigned OUTPUT = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
